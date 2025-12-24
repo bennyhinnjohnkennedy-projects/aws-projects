@@ -1,0 +1,240 @@
+import boto3
+from datetime import datetime
+import os
+import logging
+import json
+from urllib.parse import urlparse
+import psycopg2
+import csv
+import uuid
+import re
+import random
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+ecs_client = boto3.client("ecs")
+s3_client = boto3.client("s3")
+
+# --- Environment variables ---
+SECRET_NAME = os.environ['SECRET_NAME']
+s3_bucket = os.environ['S3_BUCKET']
+schema = os.environ['DB_SCHEMA']
+table = os.environ['DB_TABLE']
+TASK_GROUP = os.environ['TASK_GROUP']
+CLUSTER_NAME = os.environ["CLUSTER_NAME"]
+TASK_DEFINITION = os.environ["TASK_DEFINITION"]
+SUBNETS = os.environ["SUBNETS"].split(",")
+SECURITY_GROUPS = os.environ["SECURITY_GROUPS"].split(",")
+
+
+# --- DB Connection and Secrets ---
+def get_secret():
+    secrets_client = boto3.client('secretsmanager', region_name='eu-west-1')
+    resp = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+    return json.loads(resp['SecretString'])
+
+def get_db_credentials():
+    secret = get_secret()
+    db_url = secret['dbUrl'].replace('jdbc:', '')
+    parsed = urlparse(db_url)
+    return {
+        'dbname': parsed.path.lstrip('/'),
+        'user': secret['dbUsername'],
+        'password': secret['dbPassword'],
+        'host': parsed.hostname,
+        'port': parsed.port
+    }
+
+def get_db_connection():
+    creds = get_db_credentials()
+    return psycopg2.connect(
+        dbname=creds['dbname'],
+        user=creds['user'],
+        password=creds['password'],
+        host=creds['host'],
+        port=creds['port']
+    )
+
+
+# --- Insert or Update DB Record ---
+def update_db(contract_list, status="UPLOADED",error_file_name=None):
+    """Insert or update record with given job_status (including error reason if needed)."""
+    query = f"""
+        INSERT INTO {schema}.{table} (transaction_id, input_file_name, job_status, total_rows)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (input_file_name)
+        DO UPDATE SET job_status = EXCLUDED.job_status,
+                      total_rows = EXCLUDED.total_rows;
+    """
+    file_name_for_db = error_file_name if error_file_name is not None else contract_list.get("file_name", "UNKNOWN")
+    values = (
+        contract_list.get("transaction_id", str(uuid.uuid4())),
+        file_name_for_db,
+        status[:50],  # truncate to 50 chars
+        contract_list.get("row_count", 0)
+    )
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(query, values)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"DB insert/update failed: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+# --- Process CSV from S3 ---
+def process_csv(bucket, key):
+    row_limit = int(os.environ['ROW_LIMIT'])
+    row_count = 0
+
+    local_path = f"/tmp/{os.path.basename(key)}"
+    s3_client.download_file(bucket, key, local_path)
+
+    with open(local_path, mode="r", newline="") as csvfile:
+        reader = csv.reader(csvfile, delimiter=",")
+        header = next(reader)
+
+        if "contractid" not in header[0].strip().lower():
+            raise ValueError("CSV must have 'contractid' column")
+
+        for row in reader:
+            if row and row[0].strip():
+                row_count += 1
+
+    if row_count > row_limit:
+        raise ValueError(f"Row count {row_count} exceeds limit {row_limit}")
+
+    transaction_id = str(uuid.uuid4())
+    return {
+        "transaction_id": transaction_id,
+        "file_name": os.path.basename(key),
+        "row_count": row_count
+    }
+
+
+# --- Validate Filename ---
+def validate_filename(file_name):
+    pattern = r"^(.+?)_(\d{4}_\d{2}_\d{2}_\d{2}_\d{2})\.csv$"
+    match = re.match(pattern, file_name)
+    if not match:
+        raise ValueError("Invalid file name format. Expected <prefix>_yyyy_MM_dd_HH_mm.csv")
+
+    datetime_str = match.group(2)
+    try:
+        file_datetime = datetime.strptime(datetime_str, "%Y_%m_%d_%H_%M")
+    except ValueError:
+        raise ValueError("Invalid datetime in file name")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if file_datetime.strftime("%Y-%m-%d") != today:
+        raise ValueError(f"File date must match today's date ({today})")
+
+    return True
+
+def move_to_error_folder(bucket, key, error_file_name):
+    """Move the error file to error-files/"""
+    try:
+        file_name = key.split('/')[-1]
+        dest_key = f"massive-repricing/error-files/{error_file_name}"
+
+        # Copy then delete
+        s3_client.copy_object(
+            Bucket=bucket,
+            CopySource={'Bucket': bucket, 'Key': key},
+            Key=dest_key
+        )
+        s3_client.delete_object(Bucket=bucket, Key=key)
+        print(f"Moved {key} to {dest_key}")
+    except Exception as move_err:
+        print(f"Error moving file to error folder: {move_err}")
+
+# --- Serializer ---
+def default_serializer(o):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    raise TypeError(f"Type {type(o)} not serializable")
+
+
+# --- Lambda Handler ---
+def lambda_handler(event, context):
+
+    try: 
+        records = event.get("Records", [])
+        if not records:
+            logger.info({'statusCode': 200, 'body': 'No files to process.'})
+            return {'statusCode': 200, 'body': 'No files to process.'}
+
+        for files in records:
+            bucket = files["s3"]["bucket"]["name"]
+            key = files["s3"]["object"]["key"]
+            file_name = key.split("/")[-1]
+            logger.info(f"New file uploaded: s3://{bucket}/{key}")
+
+            transaction_id = str(uuid.uuid4())
+            contract_list = {
+                "transaction_id": transaction_id,
+                "file_name": file_name,
+                "row_count": 0
+            }
+
+            
+            validate_filename(file_name)
+            processed = process_csv(bucket, key)
+            contract_list.update(processed)
+            update_db(contract_list, status="UPLOADED")
+
+        # --- Check if ECS task already running ---
+        task_arns = ecs_client.list_tasks(
+            cluster=CLUSTER_NAME,
+            desiredStatus="RUNNING",
+            launchType="FARGATE"
+        )["taskArns"]
+
+        if task_arns:
+            details = ecs_client.describe_tasks(
+                cluster=CLUSTER_NAME,
+                tasks=task_arns
+            )
+            for task in details["tasks"]:
+                if task.get("group") == TASK_GROUP:
+                    logger.info(f"Task already running in group {TASK_GROUP}. Skipping ECS run.")
+                    return {"status": "skipped"}
+
+        # --- Run ECS Task ---
+        response = ecs_client.run_task(
+            cluster=CLUSTER_NAME,
+            taskDefinition=TASK_DEFINITION,
+            launchType="FARGATE",
+            group=TASK_GROUP,
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": SUBNETS,
+                    "securityGroups": SECURITY_GROUPS,
+                    "assignPublicIp": "DISABLED"
+                }
+            }
+        )
+
+        logger.info(f"ECS task started: {response}")
+        return {
+            "status": "started",
+            "response": json.loads(json.dumps(response, default=default_serializer))
+        }
+
+    except Exception as e:
+        # Store reason directly in job_status
+        randnumber = random.randint(10000, 99999)
+        name, ext = os.path.splitext(file_name)
+        error_file_name = f"{name}_error{randnumber}{ext}"
+        error_reason = f"ERROR: {str(e)}"[:50]
+
+        logger.error(f"Error processing {file_name}: {str(e)}")
+        update_db(contract_list, status=error_reason, error_file_name=error_file_name)
+        move_to_error_folder(bucket, key, error_file_name)

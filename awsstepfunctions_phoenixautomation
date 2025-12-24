@@ -1,0 +1,126 @@
+{
+  "Comment": "Phoenix Automation with failure status handling and SNS notifications",
+  "StartAt": "Step 1",
+  "States": {
+    "Step 1": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:eu-west-1:851725212223:function:phoenix-automation-athena-connector",
+        "Payload.$": "$"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureNotification"
+        }
+      ],
+      "Next": "Check Step 1 Result"
+    },
+    "Check Step 1 Result": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.statusCode",
+          "NumericEquals": 500,
+          "Next": "SendFailureNotification"
+        },
+        {
+          "Variable": "$.statusCode",
+          "NumericEquals": 204,
+          "Next": "Done"
+        }
+      ],
+      "Default": "Step 2"
+    },
+    "Step 2": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "arn:aws:lambda:eu-west-1:851725212223:function:phoenix-automation-appflow-connector"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureNotification"
+        }
+      ],
+      "Next": "Check Step 2 Result"
+    },
+    "Check Step 2 Result": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.statusCode",
+          "NumericEquals": 500,
+          "Next": "SendFailureNotification"
+        }
+      ],
+      "Default": "Step 3"
+    },
+    "Step 3": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:eu-west-1:851725212223:function:phoenix-automation-rds-connector",
+        "Payload.$": "$"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureNotification"
+        }
+      ],
+      "Next": "Check Step 3 Result"
+    },
+    "Check Step 3 Result": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.statusCode",
+          "NumericEquals": 500,
+          "Next": "SendFailureNotification"
+        },
+        {
+          "Variable": "$.execution_state",
+          "StringEquals": "InProgress",
+          "Next": "WaitBeforeRetryStep3"
+        }
+      ],
+      "Default": "Done"
+    },
+    "WaitBeforeRetryStep3": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "Step 3"
+    },
+    "SendFailureNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:eu-west-1:851725212223:keplero-cw-sns-notifier",
+        "Message": {
+          "ExecutionId.$": "$$.Execution.Id",
+          "StateName.$": "$$.State.Name",
+          "Error": "A Lambda function returned failure status or threw an error.",
+          "Input.$": "$"
+        },
+        "Subject": "Step Function Execution Failed"
+      },
+      "End": true
+    },
+    "Done": {
+      "Type": "Succeed"
+    }
+  }
+}

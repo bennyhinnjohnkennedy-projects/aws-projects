@@ -1,0 +1,126 @@
+import boto3
+import datetime
+import os
+import logging
+import json
+from urllib.parse import urlparse
+import psycopg2
+from botocore.exceptions import ClientError
+
+# Logger configuration
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# AWS clients
+rds_client = boto3.client('rds')
+s3_client = boto3.client('s3')
+s3 = boto3.resource('s3')
+
+# Environment variables (placeholders)
+SECRET_NAME = os.environ['SECRET_NAME']  # e.g. "my/db/secret"
+SCHEMA_LIST = tuple(os.environ.get("SCHEMA_LIST").split(","))  # e.g. "schema1,schema2"
+
+def get_secret():
+    """
+    Retrieve database credentials from AWS Secrets Manager
+    """
+    secrets_client = boto3.client('secretsmanager', region_name='<AWS_REGION>')
+    response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+    return json.loads(response['SecretString'])
+
+
+def lambda_handler(event, context):
+    db_instance_identifier = '<RDS_INSTANCE_IDENTIFIER>'
+    s3_bucket_name = '<S3_BUCKET_NAME>'
+    export_prefix = '<S3_EXPORT_PREFIX>/'
+
+    table_names = get_schema_tables()
+    logger.info(f"Tables selected for export: {table_names}")
+
+    try:
+        logger.info("Lambda execution started")
+
+        # Clean S3 bucket
+        bucket = s3.Bucket(s3_bucket_name)
+        bucket.objects.all().delete()
+
+        # Retrieve RDS snapshots
+        snapshots = rds_client.describe_db_snapshots(
+            DBInstanceIdentifier=db_instance_identifier
+        )
+
+        # Select most recent snapshot
+        snapshots_sorted = sorted(
+            snapshots['DBSnapshots'],
+            key=lambda x: x['SnapshotCreateTime'],
+            reverse=True
+        )
+        latest_snapshot = snapshots_sorted[0]
+
+        # Export task identifier
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        export_task_identifier = f"export-snapshot-{timestamp}"
+
+        # Start export task
+        rds_client.start_export_task(
+            ExportTaskIdentifier=export_task_identifier,
+            SourceArn=latest_snapshot['DBSnapshotArn'],
+            S3BucketName=s3_bucket_name,
+            S3Prefix=export_prefix,
+            IamRoleArn='<IAM_ROLE_ARN>',
+            KmsKeyId='<KMS_KEY_ARN>',
+            ExportOnly=table_names
+        )
+
+        logger.info("Snapshot export task started successfully")
+
+        return {
+            'statusCode': 200,
+            'body': 'Snapshot export initiated successfully'
+        }
+
+    except Exception as e:
+        logger.error("Lambda execution failed", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': 'Error during snapshot export'
+        }
+
+
+def get_schema_tables():
+    """
+    Retrieve fully qualified table names from selected schemas
+    """
+    secret = get_secret()
+    db_url = secret['DB_URL'].replace('jdbc:', '')
+    parsed = urlparse(db_url)
+
+    try:
+        conn = psycopg2.connect(
+            dbname=parsed.path.lstrip('/'),
+            user=secret['DB_USERNAME'],
+            password=secret['DB_PASSWORD'],
+            host=parsed.hostname,
+            port=parsed.port
+        )
+
+        cursor = conn.cursor()
+
+        query = """
+            SELECT 'postgres.' || table_schema || '.' || table_name
+            FROM information_schema.tables
+            WHERE table_schema IN %s
+            ORDER BY table_schema, table_name;
+        """
+
+        cursor.execute(query, (SCHEMA_LIST,))
+        tables = [row[0] for row in cursor.fetchall()]
+
+        cursor.close()
+        conn.close()
+
+        return tables
+
+    except Exception as e:
+        logger.error("Error retrieving schema tables", exc_info=True)
+        raise

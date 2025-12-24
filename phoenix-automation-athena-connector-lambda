@@ -1,0 +1,139 @@
+import importlib
+import os
+import boto3
+import json
+import logging
+import psycopg2
+import os
+from datetime import datetime
+from urllib.parse import urlparse
+from botocore.exceptions import ClientError
+from datetime import datetime
+
+# Logging setup
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Configuration
+SECRET_NAME = os.environ['SECRET_NAME']
+SCHEMA_NAME = os.environ['SCHEMA_NAME']
+TABLE_NAME  = os.environ['TABLE_NAME']
+
+# Boto3 client for Secrets Manager
+secrets_client = boto3.client('secretsmanager', region_name='eu-west-1')
+
+class NoDataException(Exception):
+    pass
+
+def get_db_credentials():
+    try:
+        secrets_client = boto3.client('secretsmanager', region_name='eu-west-1')
+        resp = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+        secret = json.loads(resp['SecretString'])
+
+        db_url = secret['dbUrl'].replace('jdbc:', '')
+        parsed = urlparse(db_url)
+        return {
+            'dbname': parsed.path.lstrip('/'),
+            'user': secret['dbUsername'],
+            'password': secret['dbPassword'],
+            'host': parsed.hostname,
+            'port': parsed.port
+        }
+    except ClientError as e:
+        logger.error(f"Could not retrieve secret {SECRET_NAME}: {e}")
+        raise
+
+def get_db_connection():
+    """
+    Returns a new psycopg2 connection using credentials
+    retrieved from Secrets Manager.
+    """
+    creds = get_db_credentials()
+    return psycopg2.connect(
+        dbname   = creds['dbname'],
+        user     = creds['user'],
+        password = creds['password'],
+        host     = creds['host'],
+        port     = creds['port']
+    )
+
+
+def insertValues(automation_name,status,total_records,s3_file_name,stack_trace):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        if status=="Failed":
+            cur.execute(f"INSERT INTO {SCHEMA_NAME}.{TABLE_NAME} (automation_name, status,start_date, stack_trace) VALUES (%s, %s, %s, %s)", (automation_name, status, datetime.now(), stack_trace))
+        elif total_records==0:
+            cur.execute(f"INSERT INTO {SCHEMA_NAME}.{TABLE_NAME} (automation_name, status, start_date,stack_trace,end_date,total_records) VALUES (%s, %s, %s,%s,%s,%s)", (automation_name, 'SKIPPED', datetime.now(),'NO RECORDS TO UPDATE',datetime.now(),total_records))
+        else:
+            cur.execute(f"INSERT INTO {SCHEMA_NAME}.{TABLE_NAME} (automation_name, status,total_records,s3_file_name,start_date) VALUES (%s, %s,%s,%s,%s)", (automation_name, 'STARTED',total_records,s3_file_name,datetime.now()))
+        conn.commit()
+        query = f"select id from {SCHEMA_NAME}.{TABLE_NAME}  where automation_name = '{automation_name}' and DATE(start_date)=CURRENT_DATE order by start_date desc limit 1"
+        cur.execute(query)
+        # Fetch results
+        id = cur.fetchall()
+        record_id = id[0][0]
+        cur.close()
+        conn.close()
+        return record_id
+    except Exception as e:
+        logger.error(f"Error inserting values into database: {e}")
+        return -1
+
+
+def lambda_handler(event, context):
+    # Get which automation file to run
+    automation_name = event.get("automation_name")
+
+    if not automation_name:
+        return {
+            "statusCode": 500,
+            "body": "Missing 'automation_name' in event"
+        }
+
+    try:
+        # Dynamically import the module
+        module_name = f"automation.{automation_name}"
+        automation_module = importlib.import_module(module_name)
+
+        # Call the run() function from the module
+        result = automation_module.run(event)  # Pass event if needed
+
+        # Insert values into the database
+        result_rds={}
+        record_id = insertValues(automation_name, result['status'], result['total_records'], result['s3_file_name'],result['stack_trace'])
+        result_rds['id'] = record_id
+        result_rds['automation_name'] = automation_name
+        result_rds['total_records'] = result['total_records']
+        if result['status'] == "Failed":
+            raise Exception("Automation failed-", result['stack_trace'])
+        elif result['total_records'] == 0:
+            raise NoDataException("Automation SKIPPED", "NO RECORDS TO UPDATE")
+        else:
+            return {
+                "statusCode": 200,
+                "body": result_rds  # Whatever the module returns
+            }
+
+    except ModuleNotFoundError:
+        return {
+            "statusCode": 500,
+            "body": f"Query module '{automation_name}' not found"
+        }
+    except AttributeError:
+        return {
+            "statusCode": 500,
+            "body": f"Module '{automation_name}' must have a `run(event)` function"
+        }
+    except NoDataException:
+        return {
+            "statusCode": 204,
+            "body": "No data to update"
+        }
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": f"Error running module: {str(e)}"
+        }

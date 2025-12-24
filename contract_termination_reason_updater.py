@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 import json
 
+
 ATHENA_DATABASE = os.environ['ATHENA_DATABASE']
 ATHENA_OUTPUT_LOCATION = os.environ['ATHENA_OUTPUT_LOCATION']
 S3_TARGET_BUCKET = os.environ['S3_TARGET_BUCKET']
